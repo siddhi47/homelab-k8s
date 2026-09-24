@@ -1,0 +1,138 @@
+# Open WebUI - chat front-end for the local models.
+#
+# IMPORTANT: this manifest is only half the configuration. Open WebUI stores most
+# of its settings in a SQLite database (webui.db) on the data volume, NOT in
+# environment variables. Applying this file to a fresh cluster gives you a working
+# but UNCONFIGURED Open WebUI - no model endpoints, no tool servers, no image
+# generation. See scripts/open-webui-config.sh to export and restore that half.
+#
+# Env vars here are PersistentConfig: they seed the database on first boot and are
+# ignored afterwards, because the stored value wins. Changing one on an existing
+# install requires editing the database or the admin UI.
+#
+# Notes on specific settings:
+#
+#   ENABLE_WEB_SEARCH / WEB_SEARCH_ENGINE
+#     Open WebUI renamed these from ENABLE_RAG_WEB_SEARCH / RAG_WEB_SEARCH_ENGINE.
+#     The old names are not read at all by current versions and fail silently -
+#     web search simply stays off while the config looks correct.
+#
+#   SEARXNG_QUERY_URL
+#     Uses a node address rather than the searxng Service name. Kept that way so
+#     the manifest still works if cluster DNS is unavailable; with dnsPolicy
+#     ClusterFirst below, http://searxng:8080 would also work.
+#
+#   dnsPolicy: ClusterFirst
+#     Must NOT be dnsPolicy None with public nameservers. That resolves external
+#     names but makes every in-cluster Service name unresolvable, which breaks
+#     tool servers addressed as http://mcpo:8000. CoreDNS forwards external
+#     queries upstream, so ClusterFirst gives both.
+#
+#   tex-shared / TECTONIC_CACHE_DIR
+#     The LaTeX renderer tool executes inside this pod and needs a TeX engine in
+#     this container. A statically linked tectonic binary is mounted from the host
+#     at /opt/tex, and again by subPath onto /usr/local/bin/tectonic so the tool's
+#     shutil.which() discovery finds it without configuring a valve.
+#     TECTONIC_CACHE_DIR points at the persistent volume; otherwise tectonic
+#     re-downloads ~42MB of packages after every restart.
+#
+#   nodeSelector
+#     Required: the volumes are hostPath, so the pod must land on the machine that
+#     holds the data.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: open-webui
+  name: open-webui
+  namespace: default
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: open-webui
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/restartedAt: '2026-09-24T12:58:14-07:00'
+      labels:
+        app: open-webui
+    spec:
+      containers:
+      - env:
+        - name: OLLAMA_BASE_URL
+          value: http://10.0.0.132:11435
+        - name: ENABLE_WEB_SEARCH
+          value: 'true'
+        - name: WEB_SEARCH_ENGINE
+          value: searxng
+        - name: SEARXNG_QUERY_URL
+          value: http://10.0.0.132:30081/search?q=<query>
+        - name: WEB_SEARCH_RESULT_COUNT
+          value: '3'
+        - name: WEB_SEARCH_CONCURRENT_REQUESTS
+          value: '5'
+        - name: TECTONIC_CACHE_DIR
+          value: /app/backend/data/tectonic-cache
+        image: ghcr.io/open-webui/open-webui:main
+        imagePullPolicy: IfNotPresent
+        name: open-webui
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /app/backend/data
+          name: data
+        - mountPath: /opt/tex
+          name: tex
+          readOnly: true
+        - mountPath: /usr/local/bin/tectonic
+          name: tex
+          readOnly: true
+          subPath: tectonic
+      dnsPolicy: ClusterFirst
+      nodeSelector:
+        homelab.local/cpu: 'true'
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - hostPath:
+          path: ${DATA_ROOT}/open-webui-data
+          type: DirectoryOrCreate
+        name: data
+      - hostPath:
+          path: ${DATA_ROOT}/tex-shared
+          type: DirectoryOrCreate
+        name: tex
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: open-webui
+  name: open-webui
+  namespace: default
+spec:
+  externalTrafficPolicy: Cluster
+  ports:
+  - nodePort: 30880
+    port: 8080
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    app: open-webui
+  type: NodePort

@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: jupyter-gpu
+  name: jupyter-gpu
+  namespace: default
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: jupyter-gpu
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: jupyter-gpu
+    spec:
+      containers:
+      - args:
+        - jupyter notebook --notebook-dir=/workspace --ip=0.0.0.0 --no-browser --allow-root --NotebookApp.token=$(JUPYTER_TOKEN)
+        command:
+        - /bin/bash
+        - -c
+        env:
+        - name: JUPYTER_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: token
+              name: jupyter-token
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: all
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: compute,utility
+        - name: JUPYTER_PATH
+          value: /workspace/.jupyter-data/share/jupyter
+        image: nvcr.io/nvidia/pytorch:26.08-py3
+        imagePullPolicy: IfNotPresent
+        name: jupyter
+        ports:
+        - containerPort: 8888
+          protocol: TCP
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /workspace
+          name: notebooks
+        - mountPath: /dev/shm
+          name: dshm
+      dnsConfig:
+        nameservers:
+        - 1.1.1.1
+        - 8.8.8.8
+      dnsPolicy: None
+      nodeSelector:
+        homelab.local/gpu: 'true'
+      restartPolicy: Always
+      runtimeClassName: nvidia
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - hostPath:
+          path: ${DATA_ROOT}/jupyter-data
+          type: DirectoryOrCreate
+        name: notebooks
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+        name: dshm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: jupyter-gpu
+  name: jupyter-gpu
+  namespace: default
+spec:
+  externalTrafficPolicy: Cluster
+  ports:
+  - nodePort: 30888
+    port: 8888
+    protocol: TCP
+    targetPort: 8888
+  selector:
+    app: jupyter-gpu
+  type: NodePort

@@ -1,0 +1,144 @@
+# mcpo - MCP-to-OpenAPI proxy.
+#
+# Open WebUI does not speak MCP. mcpo runs MCP servers as subprocesses and
+# republishes each one as an OpenAPI service, which Open WebUI can consume as a
+# Tool Server. With --config, each MCP server is mounted on its own subpath and
+# gets its own spec: /time/openapi.json, /fetch/openapi.json, ...
+#
+# Add each subpath to Open WebUI separately - it reads one spec per connection
+# and does not crawl the parent path.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcpo-config
+  namespace: default
+data:
+  config.json: |
+    {
+      "mcpServers": {
+        "time": {
+          "command": "uvx",
+          "args": ["mcp-server-time", "--local-timezone=America/Los_Angeles"]
+        },
+        "fetch": {
+          "command": "uvx",
+          "args": ["mcp-server-fetch"]
+        },
+        "github": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-github"]
+        },
+        "memory": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-memory"]
+        },
+        "thinking": {
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcpo
+  namespace: default
+  labels:
+    app: mcpo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcpo
+  template:
+    metadata:
+      labels:
+        app: mcpo
+    spec:
+      nodeSelector:
+        homelab.local/cpu: 'true'
+      containers:
+      - name: mcpo
+        image: ghcr.io/open-webui/mcpo:main
+        imagePullPolicy: IfNotPresent
+        args: ["--host", "0.0.0.0", "--port", "8000", "--config", "/config/config.json"]
+        env:
+        # uvx downloads each MCP server on first start, so it needs a writable
+        # HOME and cache. The image may run as a non-root user with no $HOME.
+        - name: HOME
+          value: /tmp
+        - name: UV_CACHE_DIR
+          value: /tmp/uv-cache
+        - name: XDG_DATA_HOME
+          value: /tmp/.local/share
+        # mcpo launches each MCP server as a subprocess, which inherits this
+        # environment. The GitHub server reads its token from here, so the token
+        # stays in the Secret and never appears in the ConfigMap above.
+        - name: GITHUB_PERSONAL_ACCESS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: resume-ai-secrets
+              key: GITHUB_PERSONAL_ACCESS_TOKEN
+        # The memory server keeps a knowledge graph on disk. Without a persistent
+        # path it would live in the ephemeral /tmp and be lost on every restart.
+        - name: MEMORY_FILE_PATH
+          value: /data/memory.json
+        ports:
+        - containerPort: 8000
+          protocol: TCP
+        volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        - name: data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            memory: 1Gi
+        # Startup is slow the first time: uvx resolves and downloads two packages
+        # before the HTTP server binds. Give it room rather than crash-looping.
+        startupProbe:
+          httpGet:
+            path: /docs
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet:
+            path: /docs
+            port: 8000
+          periodSeconds: 20
+          timeoutSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: mcpo-config
+      - name: tmp
+        emptyDir: {}
+      - name: data
+        hostPath:
+          path: /var/lib/mcpo-data
+          type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcpo
+  namespace: default
+  labels:
+    app: mcpo
+spec:
+  type: ClusterIP
+  selector:
+    app: mcpo
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP

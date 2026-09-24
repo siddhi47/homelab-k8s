@@ -1,0 +1,9 @@
+config.env
+secrets.env
+*.tar
+cline/kubeconfig-cline.yaml
+kubeconfig-cline.yaml
+
+# full config exports contain credentials
+*-secrets.json
+open-webui-config-secrets.json

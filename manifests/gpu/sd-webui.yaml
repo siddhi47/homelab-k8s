@@ -1,0 +1,156 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: sd-webui
+  name: sd-webui
+  namespace: default
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 0
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: sd-webui
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: sd-webui
+    spec:
+      containers:
+      - args:
+        - "set -e\ncd /app/webui\ncat > /tmp/cv2_fix.py << 'PYEOF'\nimport os\nimport faulthandler\nimport\
+          \ signal\nfaulthandler.register(signal.SIGUSR1, all_threads=True)\np = \"/usr/local/lib/python3.10/dist-packages/cv2/typing/__init__.py\"\
+          \nif os.path.exists(p):\n    c = open(p).read()\n    c2 = c.replace(\"LayerId = cv2.dnn.DictValue\"\
+          , \"LayerId = getattr(cv2.dnn, 'DictValue', None)\")\n    if c2 != c:\n        open(p, \"w\"\
+          ).write(c2)\nPYEOF\ngrep -q 'exec(open(\"/tmp/cv2_fix.py\")' modules/launch_utils.py || \\\n\
+          \  sed -i '/import webui/i\\    exec(open(\"/tmp/cv2_fix.py\").read())' modules/launch_utils.py\n\
+          mkdir -p /root/.cache\nif [ -d /app/webui/repositories/.hf-cache-seed/hub ] && [ ! -d /root/.cache/huggingface\
+          \ ]; then\n  echo \"Restoring previously-downloaded HuggingFace cache...\"\n  cp -r /app/webui/repositories/.hf-cache-seed\
+          \ /root/.cache/huggingface\nfi\nmkdir -p /app/webui/config\nexec python3 launch.py --api --listen\
+          \ --port 7860 --skip-torch-cuda-test --skip-python-version-check --no-hashing --enable-insecure-extension-access\
+          \ --ui-settings-file /app/webui/config/config.json --ui-config-file /app/webui/config/ui-config.json\
+          \ --styles-file /app/webui/config/styles.csv\n"
+        command:
+        - /bin/bash
+        - -c
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: all
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: compute,utility
+        - name: STABLE_DIFFUSION_REPO
+          value: https://github.com/w-e-w/stablediffusion.git
+        - name: HF_HUB_DOWNLOAD_TIMEOUT
+          value: '15'
+        - name: HF_HUB_ETAG_TIMEOUT
+          value: '10'
+        - name: TORCHINDUCTOR_COMPILE_THREADS
+          value: '1'
+        - name: TORCH_COMPILE_DISABLE
+          value: '1'
+        - name: OMP_NUM_THREADS
+          value: '1'
+        - name: MKL_NUM_THREADS
+          value: '1'
+        - name: OPENBLAS_NUM_THREADS
+          value: '1'
+        - name: NUMEXPR_NUM_THREADS
+          value: '1'
+        image: sd-webui:local
+        imagePullPolicy: Never
+        name: sd-webui
+        ports:
+        - containerPort: 7860
+          protocol: TCP
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /usr/local/lib/python3.10/dist-packages
+          name: sd-webui-data
+          subPath: dist-packages
+        - mountPath: /app/webui/models
+          name: sd-webui-data
+          subPath: models
+        - mountPath: /app/webui/outputs
+          name: sd-webui-data
+          subPath: outputs
+        - mountPath: /app/webui/repositories
+          name: sd-webui-data
+          subPath: repositories
+        - mountPath: /app/webui/extensions
+          name: sd-webui-data
+          subPath: extensions
+        - mountPath: /app/webui/embeddings
+          name: sd-webui-data
+          subPath: embeddings
+        - mountPath: /app/webui/config
+          name: sd-webui-data
+          subPath: config
+        - mountPath: /dev/shm
+          name: dshm
+      dnsConfig:
+        nameservers:
+        - 1.1.1.1
+        - 8.8.8.8
+      dnsPolicy: None
+      initContainers:
+      - args:
+        - "set -e\nmkdir -p /data/dist-packages /data/models/Stable-diffusion /data/outputs /data/repositories\n\
+          if [ -z \"$(ls -A /data/dist-packages 2>/dev/null)\" ]; then\n  echo \"Seeding persistent dist-packages\
+          \ from baked-in image content (one-time, ~6GB)...\"\n  cp -r /usr/local/lib/python3.10/dist-packages/.\
+          \ /data/dist-packages/\nfi\nif [ -z \"$(ls -A /data/models/Stable-diffusion 2>/dev/null)\" ];\
+          \ then\n  echo \"Seeding persistent models dir from baked-in image content...\"\n  cp -r /app/webui/models/Stable-diffusion/.\
+          \ /data/models/Stable-diffusion/\nfi\n"
+        command:
+        - /bin/bash
+        - -c
+        image: sd-webui:local
+        imagePullPolicy: Never
+        name: seed-persistent-dirs
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /data
+          name: sd-webui-data
+      nodeSelector:
+        homelab.local/gpu: 'true'
+      restartPolicy: Always
+      runtimeClassName: nvidia
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - hostPath:
+          path: ${DATA_ROOT}/sd-webui-data
+          type: DirectoryOrCreate
+        name: sd-webui-data
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+        name: dshm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: sd-webui
+  name: sd-webui
+  namespace: default
+spec:
+  externalTrafficPolicy: Cluster
+  ports:
+  - nodePort: 30860
+    port: 7860
+    protocol: TCP
+    targetPort: 7860
+  selector:
+    app: sd-webui
+  type: NodePort

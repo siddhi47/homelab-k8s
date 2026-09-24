@@ -1,0 +1,46 @@
+# Read-only cluster access for Cline (or any other AI coding agent).
+#
+# Deliberately NOT cluster-admin. An agent decides on its own what commands to run,
+# so it gets the narrowest role that still lets it diagnose things:
+#
+#   view  =  get / list / watch on workloads, services, events, and pods/log
+#            NO secrets, NO exec, NO port-forward, NO writes of any kind.
+#
+# Apply with:  kubectl apply -f cline-rbac.yaml
+#
+# To let the agent actually change the cluster later, swap `view` for `edit`
+# (namespaced write, still no RBAC/secrets) by editing roleRef.name below and
+# re-applying. Think twice before `cluster-admin`.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cline
+  namespace: default
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cline-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: cline
+    namespace: default
+
+---
+# Kubernetes 1.24+ no longer auto-creates a token Secret for a ServiceAccount.
+# This requests a long-lived one, which is what a kubeconfig on another machine
+# needs (`kubectl create token` issues a short-lived token that expires).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cline-token
+  namespace: default
+  annotations:
+    kubernetes.io/service-account.name: cline
+type: kubernetes.io/service-account-token
