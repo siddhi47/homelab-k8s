@@ -1,0 +1,129 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "edit_test.png",
+      "upload": "image"
+    }
+  },
+  "2": {
+    "class_type": "ImageScaleToTotalPixels",
+    "inputs": {
+      "image": [
+        "1",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "megapixels": 1.0,
+      "resolution_steps": 16
+    }
+  },
+  "3": {
+    "class_type": "GetImageSize",
+    "inputs": {
+      "image": [
+        "2",
+        0
+      ]
+    }
+  },
+  "4": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "mage_flow_edit_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "5": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_4b_bf16.safetensors",
+      "type": "mage",
+      "device": "default"
+    }
+  },
+  "6": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "mage_flow_vae_bf16.safetensors"
+    }
+  },
+  "7": {
+    "class_type": "TextEncodeMageFlowEdit",
+    "inputs": {
+      "clip": [
+        "5",
+        0
+      ],
+      "prompt": "make the fish solid gold",
+      "negative_prompt": "",
+      "width": [
+        "3",
+        0
+      ],
+      "height": [
+        "3",
+        1
+      ],
+      "batch_size": 1,
+      "vae": [
+        "6",
+        0
+      ],
+      "images.image_1": [
+        "2",
+        0
+      ]
+    }
+  },
+  "8": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "4",
+        0
+      ],
+      "positive": [
+        "7",
+        0
+      ],
+      "negative": [
+        "7",
+        1
+      ],
+      "latent_image": [
+        "7",
+        2
+      ],
+      "seed": 12345,
+      "steps": 30,
+      "cfg": 5.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0
+    }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "8",
+        0
+      ],
+      "vae": [
+        "6",
+        0
+      ]
+    }
+  },
+  "10": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "9",
+        0
+      ],
+      "filename_prefix": "mage-flow-edit"
+    }
+  }
+}

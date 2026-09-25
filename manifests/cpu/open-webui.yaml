@@ -61,8 +61,6 @@ spec:
     type: RollingUpdate
   template:
     metadata:
-      annotations:
-        kubectl.kubernetes.io/restartedAt: '2026-09-24T12:58:14-07:00'
       labels:
         app: open-webui
     spec:

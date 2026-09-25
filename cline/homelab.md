@@ -72,11 +72,36 @@ command and let the human run it.
 
 ## Models
 
-- Mac (10.0.0.35, via localhost:11434): `qwen3-coder:30b` and `qwen3:32b`, but
-  `OLLAMA_MAX_LOADED_MODELS=1` and they are ~20GB each, so **only one is resident at a
-  time**. Requesting the other evicts the first and costs a ~9s reload. `qwen3-coder`
-  is pinned resident with `OLLAMA_KEEP_ALIVE=-1` at a 64k context.
-- Measured throughput on the Mac: ~840 tok/s prompt processing, ~75 tok/s generation.
-  A 13k-token request takes ~20s, nearly all of it prompt processing. Keep context
-  tight; it is the dominant cost.
-- The GPU node has 6GB of VRAM. It runs small models and image generation only.
+Mac inference server (10.0.0.35, reachable on localhost:11434 through the tunnel).
+`OLLAMA_MAX_LOADED_MODELS=2` and `OLLAMA_KEEP_ALIVE=-1`, so two models stay resident
+indefinitely:
+
+| Model | Resident | Vision | Tools |
+|---|---|---|---|
+| `qwen3:32b` | 31.4 GB @ 40k ctx | no | yes |
+| `qwen3.5:4b` | 5.9 GB @ 64k ctx | **yes** | yes |
+| `qwen3-coder:30b` | 25 GB (not resident) | no | yes |
+
+That is 37.2 GB of a 38.3 GB Metal working-set budget, so roughly 1 GB spare. A
+request for `qwen3-coder:30b` must evict something and costs a full reload (~72s).
+If tool calls or chat suddenly feel slow, check `/api/ps` before suspecting anything
+else.
+
+Measured on this hardware:
+
+| | prompt eval | generation |
+|---|---|---|
+| `qwen3:32b` (dense) | 163 tok/s | 22 tok/s |
+| `qwen3-coder:30b` (MoE, ~3B active) | 841 tok/s | 75 tok/s |
+
+The MoE model reads five times faster. That matters most for tool-heavy chat, where
+tool schemas dominate the prompt: five attached tool servers are about 16k tokens of
+schema on *every* message, which is ~98s of prompt eval on the dense model versus
+~19s on the MoE. Attach only the tools a conversation needs.
+
+Only `qwen3.5:4b` and `medgemma1.5` accept images. `qwen3:32b` rejects any request
+carrying image data outright ("model does not support multimodal requests"), so
+image editing in Open WebUI must use the 4B even though ComfyUI does the actual
+work — Open WebUI attaches the image to the chat request, not only to the tool.
+
+The GPU node has 6 GB of VRAM and runs small models plus image generation only.
