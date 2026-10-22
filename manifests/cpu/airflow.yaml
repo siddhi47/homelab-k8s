@@ -1,0 +1,549 @@
+# Apache Airflow 3 - KubernetesExecutor, Postgres metadata DB, DAGs from git.
+#
+# Three long-running pods in `default`:
+#   airflow-postgres     metadata database
+#   airflow-api-server   UI + REST API + Execution API. Runs `db migrate` and
+#                        creates the admin user in an initContainer.
+#   airflow-scheduler    scheduler, dag-processor and triggerer as sibling
+#                        containers, plus a git-sync sidecar feeding all three.
+#
+# Plus one short-lived pod per task instance, in the `airflow-tasks` namespace,
+# built from the airflow-pod-template ConfigMap below. Each worker pod clones
+# the DAG repo in an initContainer, runs the one task in a container named
+# `base`, and is deleted when the task succeeds (kept on failure, for
+# `kubectl logs`).
+#
+# Notes:
+#
+#   Why not the Helm chart
+#     The chart runs ~8 pods (statsd, pgbouncer, redis, workers...). This node
+#     has ~4 GiB free.
+#
+#   Why a separate namespace for task pods
+#     The executor needs create/delete on pods. Granting that in `default`
+#     would let Airflow delete open-webui, ollama, etc. The Role below is
+#     scoped to airflow-tasks only. The same Role is bound to the worker
+#     ServiceAccount so a task can itself launch pods (KubernetesPodOperator)
+#     in that namespace.
+#
+#   Per-task resources / GPU
+#     Worker pods default to the CPU node with a 1 GiB memory limit. Override
+#     per task with executor_config={"pod_override": k8s.V1Pod(...)} - see
+#     the README. A task moved to the GPU node writes its log to that node's
+#     hostPath, so the UI shows the log while the pod runs (read from the pod)
+#     but not after it finishes.
+#
+#   AIRFLOW__CORE__EXECUTION_API_SERVER_URL
+#     Airflow 3 task processes don't touch the database; they report state
+#     through the Execution API on the api-server. Worker pods live in another
+#     namespace, so they use the full Service DNS name.
+#
+#   JWT secret / API secret key / Fernet key
+#     Must be identical across the api-server and scheduler, which is why they
+#     come from the airflow-secrets Secret rather than per-process defaults
+#     (the scheduler's task tokens are otherwise rejected by the api-server).
+#     Worker pods need none of them: they get a per-task token in their
+#     command line and fetch connections/variables through the Execution API.
+#
+#   Postgres password
+#     Interpolated into a URL via $(AIRFLOW_DB_PASSWORD), so it must be
+#     URL-safe. create-secrets.sh generates hex.
+#
+#   git-sync
+#     The scheduler pod pulls the DAG repo every 60s into an emptyDir; its
+#     initContainer copy does one sync first so the dag-processor never starts
+#     on an empty folder. Worker pods do a single sync, using the airflow-git
+#     Secret in airflow-tasks (Secrets can't be read across namespaces). An
+#     empty repo (no commits on the branch) makes it fail.
+#
+#   Logs
+#     hostPath shared by the worker pods (write) and the api-server (read).
+#     Works because both are pinned to the same node. The image runs as uid
+#     50000, which can't write to a root-owned hostPath dir, hence the chown
+#     initContainers.
+#
+#   nodeSelector
+#     Required: hostPath volumes.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: airflow-tasks
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: airflow
+  namespace: default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: airflow-worker
+  namespace: airflow-tasks
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: airflow-pods
+  namespace: airflow-tasks
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["create", "get", "list", "watch", "patch", "delete", "deletecollection"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: airflow-pods
+  namespace: airflow-tasks
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: airflow-pods
+subjects:
+- kind: ServiceAccount
+  name: airflow
+  namespace: default
+- kind: ServiceAccount
+  name: airflow-worker
+  namespace: airflow-tasks
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: airflow-postgres
+  name: airflow-postgres
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-postgres
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: airflow-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:17-alpine
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: POSTGRES_USER
+          value: airflow
+        - name: POSTGRES_DB
+          value: airflow
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: airflow-secrets
+              key: postgres-password
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - containerPort: 5432
+          protocol: TCP
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "airflow", "-d", "airflow"]
+          periodSeconds: 10
+        resources:
+          requests:
+            memory: 128Mi
+          limits:
+            memory: 512Mi
+        volumeMounts:
+        - mountPath: /var/lib/postgresql/data
+          name: data
+      nodeSelector:
+        homelab.local/cpu: 'true'
+      volumes:
+      - hostPath:
+          path: ${DATA_ROOT}/airflow-data/postgres
+          type: DirectoryOrCreate
+        name: data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: airflow-postgres
+  name: airflow-postgres
+  namespace: default
+spec:
+  ports:
+  - port: 5432
+    protocol: TCP
+    targetPort: 5432
+  selector:
+    app: airflow-postgres
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app: airflow
+  name: airflow-env
+  namespace: default
+data:
+  AIRFLOW__CORE__EXECUTOR: KubernetesExecutor
+  # Max concurrent task pods. Each takes ~300 MiB; the CPU node is tight.
+  AIRFLOW__CORE__PARALLELISM: '6'
+  AIRFLOW__KUBERNETES_EXECUTOR__NAMESPACE: airflow-tasks
+  AIRFLOW__KUBERNETES_EXECUTOR__POD_TEMPLATE_FILE: /opt/airflow/pod_templates/pod_template.yaml
+  AIRFLOW__KUBERNETES_EXECUTOR__DELETE_WORKER_PODS: 'True'
+  AIRFLOW__KUBERNETES_EXECUTOR__DELETE_WORKER_PODS_ON_FAILURE: 'False'
+  AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+  AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+  AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags/repo/${AIRFLOW_DAGS_SUBDIR}
+  AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: '60'
+  AIRFLOW__API__BASE_URL: http://${CLUSTER_IP}:30808
+  # Shows Admin > Config in the UI; Airflow 3.3 always masks sensitive values.
+  AIRFLOW__API__EXPOSE_CONFIG: 'True'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app: airflow
+  name: airflow-pod-template
+  namespace: default
+data:
+  pod_template.yaml: |
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: placeholder
+    spec:
+      serviceAccountName: airflow-worker
+      restartPolicy: Never
+      nodeSelector:
+        homelab.local/cpu: 'true'
+      initContainers:
+      - name: git-sync
+        image: registry.k8s.io/git-sync/git-sync:v4.7.1
+        args:
+        - --repo=${AIRFLOW_DAGS_REPO}
+        - --ref=${AIRFLOW_DAGS_BRANCH}
+        - --root=/git
+        - --link=repo
+        - --depth=1
+        - --one-time
+        env:
+        - name: GITSYNC_USERNAME
+          valueFrom:
+            secretKeyRef: {name: airflow-git, key: username}
+        - name: GITSYNC_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: airflow-git, key: token}
+        volumeMounts:
+        - mountPath: /git
+          name: dags
+      containers:
+      - name: base
+        image: apache/airflow:3.3.2
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: AIRFLOW__CORE__EXECUTION_API_SERVER_URL
+          value: http://airflow-api-server.default.svc.cluster.local:8080/execution/
+        - name: AIRFLOW__CORE__DAGS_FOLDER
+          value: /opt/airflow/dags/repo/${AIRFLOW_DAGS_SUBDIR}
+        - name: AIRFLOW__CORE__LOAD_EXAMPLES
+          value: 'False'
+        resources:
+          requests:
+            memory: 256Mi
+          limits:
+            memory: 1Gi
+        volumeMounts:
+        - mountPath: /opt/airflow/dags
+          name: dags
+          readOnly: true
+        - mountPath: /opt/airflow/logs
+          name: logs
+      volumes:
+      - emptyDir: {}
+        name: dags
+      - hostPath:
+          path: ${DATA_ROOT}/airflow-data/logs
+          type: DirectoryOrCreate
+        name: logs
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: airflow-api-server
+  name: airflow-api-server
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-api-server
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: airflow-api-server
+    spec:
+      serviceAccountName: airflow
+      initContainers:
+      - name: fix-perms
+        image: busybox:1.37
+        command: ["sh", "-c", "chown 50000:0 /opt/airflow/logs"]
+        volumeMounts:
+        - mountPath: /opt/airflow/logs
+          name: logs
+      - name: migrate
+        image: apache/airflow:3.3.2
+        imagePullPolicy: IfNotPresent
+        command:
+        - bash
+        - -c
+        - |
+          set -e
+          until airflow db check >/dev/null 2>&1; do echo "waiting for postgres"; sleep 3; done
+          airflow db migrate
+          airflow users create --role Admin --username admin \
+            --password "$AIRFLOW_ADMIN_PASSWORD" \
+            --firstname Admin --lastname User --email admin@example.com
+          # Default connection for KubernetesPodOperator / KubernetesHook.
+          # Uses the calling pod's ServiceAccount; task pods run as
+          # airflow-worker, which may manage pods in airflow-tasks only.
+          # Created once - later edits in the UI are kept.
+          airflow connections get kubernetes_default >/dev/null 2>&1 ||
+            airflow connections add kubernetes_default --conn-type kubernetes \
+              --conn-description "This cluster (in-cluster ServiceAccount)" \
+              --conn-extra '{"in_cluster": true, "namespace": "airflow-tasks"}'
+        envFrom: &airflow-envfrom
+        - configMapRef:
+            name: airflow-env
+        env: &airflow-env
+        - name: AIRFLOW_DB_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: postgres-password}
+        - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+          value: postgresql+psycopg2://airflow:$(AIRFLOW_DB_PASSWORD)@airflow-postgres:5432/airflow
+        - name: AIRFLOW__CORE__FERNET_KEY
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: fernet-key}
+        - name: AIRFLOW__API__SECRET_KEY
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: api-secret-key}
+        - name: AIRFLOW__API_AUTH__JWT_SECRET
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: jwt-secret}
+        - name: AIRFLOW_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: admin-password}
+      containers:
+      - name: api-server
+        image: apache/airflow:3.3.2
+        imagePullPolicy: IfNotPresent
+        args: ["api-server"]
+        envFrom: *airflow-envfrom
+        env: *airflow-env
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /api/v2/monitor/health
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 15
+          timeoutSeconds: 5
+        resources:
+          requests:
+            memory: 512Mi
+          limits:
+            memory: 1536Mi
+        volumeMounts:
+        - mountPath: /opt/airflow/logs
+          name: logs
+      nodeSelector:
+        homelab.local/cpu: 'true'
+      volumes:
+      - hostPath:
+          path: ${DATA_ROOT}/airflow-data/logs
+          type: DirectoryOrCreate
+        name: logs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: airflow-api-server
+  name: airflow-api-server
+  namespace: default
+spec:
+  externalTrafficPolicy: Cluster
+  ports:
+  - nodePort: 30808
+    port: 8080
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    app: airflow-api-server
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: airflow-scheduler
+  name: airflow-scheduler
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow-scheduler
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: airflow-scheduler
+    spec:
+      serviceAccountName: airflow
+      initContainers:
+      - name: fix-perms
+        image: busybox:1.37
+        command: ["sh", "-c", "chown 50000:0 /opt/airflow/logs"]
+        volumeMounts:
+        - mountPath: /opt/airflow/logs
+          name: logs
+      - name: git-sync-init
+        image: registry.k8s.io/git-sync/git-sync:v4.7.1
+        args: &git-sync-args
+        - --repo=${AIRFLOW_DAGS_REPO}
+        - --ref=${AIRFLOW_DAGS_BRANCH}
+        - --root=/git
+        - --link=repo
+        - --depth=1
+        - --period=60s
+        env:
+        - name: GITSYNC_USERNAME
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: git-username}
+        - name: GITSYNC_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: git-token}
+        - name: GITSYNC_ONE_TIME
+          value: 'true'
+        volumeMounts:
+        - mountPath: /git
+          name: dags
+      - name: wait-for-migrations
+        image: apache/airflow:3.3.2
+        imagePullPolicy: IfNotPresent
+        args: ["db", "check-migrations", "--migration-wait-timeout", "600"]
+        envFrom: &airflow-envfrom
+        - configMapRef:
+            name: airflow-env
+        env: &airflow-env
+        - name: AIRFLOW_DB_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: postgres-password}
+        - name: AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
+          value: postgresql+psycopg2://airflow:$(AIRFLOW_DB_PASSWORD)@airflow-postgres:5432/airflow
+        - name: AIRFLOW__CORE__FERNET_KEY
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: fernet-key}
+        - name: AIRFLOW__API__SECRET_KEY
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: api-secret-key}
+        - name: AIRFLOW__API_AUTH__JWT_SECRET
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: jwt-secret}
+        - name: AIRFLOW_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: admin-password}
+      containers:
+      - name: scheduler
+        image: apache/airflow:3.3.2
+        imagePullPolicy: IfNotPresent
+        args: ["scheduler"]
+        envFrom: *airflow-envfrom
+        env: *airflow-env
+        resources:
+          requests:
+            memory: 384Mi
+          limits:
+            memory: 1Gi
+        volumeMounts: &airflow-mounts
+        - mountPath: /opt/airflow/dags
+          name: dags
+          readOnly: true
+        - mountPath: /opt/airflow/logs
+          name: logs
+        - mountPath: /opt/airflow/pod_templates
+          name: pod-template
+          readOnly: true
+      - name: dag-processor
+        image: apache/airflow:3.3.2
+        imagePullPolicy: IfNotPresent
+        args: ["dag-processor"]
+        envFrom: *airflow-envfrom
+        env: *airflow-env
+        resources:
+          requests:
+            memory: 256Mi
+          limits:
+            memory: 1Gi
+        volumeMounts: *airflow-mounts
+      - name: triggerer
+        image: apache/airflow:3.3.2
+        imagePullPolicy: IfNotPresent
+        args: ["triggerer"]
+        envFrom: *airflow-envfrom
+        env: *airflow-env
+        resources:
+          requests:
+            memory: 256Mi
+          limits:
+            memory: 768Mi
+        volumeMounts: *airflow-mounts
+      - name: git-sync
+        image: registry.k8s.io/git-sync/git-sync:v4.7.1
+        args: *git-sync-args
+        env:
+        - name: GITSYNC_USERNAME
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: git-username}
+        - name: GITSYNC_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: airflow-secrets, key: git-token}
+        resources:
+          limits:
+            memory: 128Mi
+        volumeMounts:
+        - mountPath: /git
+          name: dags
+      nodeSelector:
+        homelab.local/cpu: 'true'
+      volumes:
+      - emptyDir: {}
+        name: dags
+      - hostPath:
+          path: ${DATA_ROOT}/airflow-data/logs
+          type: DirectoryOrCreate
+        name: logs
+      - configMap:
+          name: airflow-pod-template
+        name: pod-template

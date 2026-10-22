@@ -36,6 +36,7 @@ credential or a machine-specific hostname.
 | `resume-ai` | cpu | 30505 | Resume/cover-letter generator (Flask + tectonic) |
 | `open-webui` | cpu | 30880 | Chat UI in front of Ollama |
 | `searxng` | cpu | 30081 | Self-hosted metasearch, backs Open WebUI's web search |
+| `airflow-api-server` | cpu | 30808 | Airflow 3 UI/API (+ `airflow-scheduler`, `airflow-postgres`) |
 | `ollama` | gpu | 30434 | LLM serving |
 | `comfyui` | gpu | 30188 | Image generation (node-graph; handles SDXL/Flux/Z-Image) |
 | `sd-webui` | gpu | 30860 | AUTOMATIC1111 (optional; ComfyUI is the better backend) |
@@ -79,6 +80,7 @@ sd-webui-data/    A1111 checkpoints, VAEs, extensions, config
 jupyter-data/     notebooks and the persistent kernel venv
 open-webui-data/  webui.db - accounts, chat history, settings
 resume-ai-data/   agent checkpoint sqlite + generated PDFs
+airflow-data/     postgres/ (metadata DB) and logs/ (task logs)
 ```
 
 ComfyUI additionally mounts `sd-webui-data/models` **read-only**, so both image
@@ -132,6 +134,10 @@ values:
 - `my-secrets` - OpenAI + LangSmith, for `my-infer`
 - `resume-ai-secrets` - OpenAI, Flask `SECRET_KEY`, GitHub PAT, LangSmith
 - `jupyter-token` - the Jupyter login token
+- `airflow-secrets` - git-sync credentials, the `admin` UI password, and the
+  Postgres password / Fernet key / API + JWT secrets. The last four are generated
+  on first run and kept on re-runs; `./scripts/create-secrets.sh airflow` touches
+  only this secret.
 
 Re-running is safe; it applies over the existing secrets. Verify with
 `kubectl describe secret <name>` (shows key names and sizes, not values).
@@ -144,6 +150,42 @@ Re-running is safe; it applies over the existing secrets. Verify with
 
 Deletes deployments and services after confirmation. Deliberately leaves secrets
 and hostPath data alone — remove those by hand if you really mean it.
+
+## Airflow
+
+Airflow 3.3 with KubernetesExecutor — `manifests/cpu/airflow.yaml` explains the
+layout. The scheduler, dag-processor and triggerer run in `default`; **every task
+runs in its own pod in the `airflow-tasks` namespace** (`hello-say-xxxx`), which
+is deleted on success and kept on failure for `kubectl -n airflow-tasks logs`.
+
+DAGs come from git: set `AIRFLOW_DAGS_REPO` / `_BRANCH` / `_SUBDIR` in
+`config.env`, and `AIRFLOW_GIT_TOKEN` (a read-only PAT) in `secrets.env`. A push
+shows up in the UI within about two minutes. Task pods clone the repo at start,
+so they always run the latest commit. The branch needs at least one commit or
+the scheduler pod stays in `Init`.
+
+Log in at `http://<node>:30808` as `admin`.
+
+Task pods default to the CPU node, `apache/airflow:3.3.2`, 1 GiB memory. Override
+per task — a different image (for extra Python packages), more memory, or the GPU:
+
+```python
+from kubernetes.client import models as k8s
+
+@task(executor_config={"pod_override": k8s.V1Pod(spec=k8s.V1PodSpec(
+    runtime_class_name="nvidia",
+    node_selector={"homelab.local/gpu": "true"},
+    containers=[k8s.V1Container(
+        name="base",                      # must be "base"
+        image="my-airflow-gpu:latest",    # FROM apache/airflow:3.3.2 + your deps
+        resources=k8s.V1ResourceRequirements(limits={"memory": "8Gi"}),
+    )],
+))})
+def train(): ...
+```
+
+A task placed on the GPU node writes its log to that node's disk: the UI shows
+it while the task runs, not after.
 
 ## Open WebUI: configuration lives in two places
 

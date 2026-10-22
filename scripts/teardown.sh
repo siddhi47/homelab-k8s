@@ -7,5 +7,5 @@ read -rp "  Delete all homelab deployments/services? [y/N] " a
 for f in "$ROOT"/manifests/*/*.yaml; do
   render "$f" | kubectl delete --ignore-not-found -f - >/dev/null 2>&1 && c_ok "$(basename "$f")"
 done
-c_warn "secrets kept (delete: kubectl delete secret my-secrets resume-ai-secrets jupyter-token)"
+c_warn "secrets kept (delete: kubectl delete secret my-secrets resume-ai-secrets jupyter-token airflow-secrets; kubectl -n airflow-tasks delete secret airflow-git)"
 c_warn "hostPath data under \$DATA_ROOT on each node kept - remove manually if wanted"

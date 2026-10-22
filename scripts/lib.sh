@@ -12,7 +12,9 @@ load_config() {
   # shellcheck disable=SC1090
   set -a; source "$ROOT/config.env"; set +a
   : "${DATA_ROOT:?}" "${CPU_NODE:?}"
-  export DATA_ROOT CPU_NODE GPU_NODE CLUSTER_IP
+  : "${AIRFLOW_DAGS_BRANCH:=main}" "${AIRFLOW_DAGS_SUBDIR:=}"
+  export DATA_ROOT CPU_NODE GPU_NODE CLUSTER_IP \
+    AIRFLOW_DAGS_REPO AIRFLOW_DAGS_BRANCH AIRFLOW_DAGS_SUBDIR
 }
 
 need() { command -v "$1" >/dev/null 2>&1 || { c_err "required command not found: $1"; exit 1; }; }
@@ -20,4 +22,6 @@ need() { command -v "$1" >/dev/null 2>&1 || { c_err "required command not found:
 # Render a manifest, substituting ONLY our own variables. Restricting the list
 # matters: some manifests embed shell scripts full of $(...) and \$VAR that
 # must be left untouched.
-render() { envsubst '${DATA_ROOT} ${CLUSTER_IP}' < "$1"; }
+render() {
+  envsubst '${DATA_ROOT} ${CLUSTER_IP} ${AIRFLOW_DAGS_REPO} ${AIRFLOW_DAGS_BRANCH} ${AIRFLOW_DAGS_SUBDIR}' < "$1"
+}
