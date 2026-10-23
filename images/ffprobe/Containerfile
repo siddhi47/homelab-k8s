@@ -1,0 +1,6 @@
+# ffprobe + jq, for probing media from Airflow (KubernetesPodOperator).
+#   ./scripts/build-images.sh push ffprobe:1 images/ffprobe
+FROM docker.io/library/alpine:3.22
+RUN apk add --no-cache ffmpeg jq ca-certificates
+COPY probe.sh /usr/local/bin/probe
+ENTRYPOINT ["/usr/local/bin/probe"]

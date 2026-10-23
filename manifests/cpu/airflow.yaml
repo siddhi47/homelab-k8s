@@ -94,6 +94,12 @@ rules:
 - apiGroups: [""]
   resources: ["pods/log"]
   verbs: ["get", "list"]
+# KubernetesPodOperator(do_xcom_push=True) reads the result by exec'ing into
+# its xcom sidecar. Without this the task fails after the pod succeeds, with
+# "'NoneType' object has no attribute 'decode'" (the client's 403).
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create", "get"]
 - apiGroups: [""]
   resources: ["events"]
   verbs: ["get", "list", "watch"]
@@ -273,6 +279,12 @@ data:
           readOnly: true
         - mountPath: /opt/airflow/logs
           name: logs
+        # Local stand-in for an S3 bucket while developing DAGs: tasks see it
+        # as file:///opt/airflow/test-bucket. Create it owned by your user with
+        # group root + setgid (install -d -o $USER -g root -m 2775 ...) so you
+        # can copy files in and the airflow user (gid 0) can write.
+        - mountPath: /opt/airflow/test-bucket
+          name: test-bucket
       volumes:
       - emptyDir: {}
         name: dags
@@ -280,6 +292,10 @@ data:
           path: ${DATA_ROOT}/airflow-data/logs
           type: DirectoryOrCreate
         name: logs
+      - hostPath:
+          path: ${DATA_ROOT}/airflow-data/test-bucket
+          type: DirectoryOrCreate
+        name: test-bucket
 ---
 apiVersion: apps/v1
 kind: Deployment
