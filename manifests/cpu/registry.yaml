@@ -1,0 +1,101 @@
+# Container registry - CNCF Distribution (registry:3). Push images you build
+# here and every node can pull them, instead of `podman save` + importing into
+# each node's containerd.
+#
+#   podman push --tls-verify=false ${CLUSTER_IP}:30500/training:abc123
+#   image: ${CLUSTER_IP}:30500/training:abc123      # in a manifest or DAG
+#
+# Notes:
+#
+#   Plain HTTP, no auth
+#     LAN-only. Anyone who can reach the port can push and pull. Fine for a
+#     homelab; add htpasswd auth (REGISTRY_AUTH_*) before exposing it further.
+#
+#   Nodes must be told about it
+#     Image pulls are done by containerd on the node, not inside the cluster:
+#     it can't resolve Service names and expects HTTPS by default. Each node
+#     needs /etc/rancher/k3s/registries.yaml marking ${CLUSTER_IP}:30500 as an
+#     HTTP endpoint, then a k3s restart. scripts/registry-node-setup.sh does it.
+#     Without that, pulls fail with "http: server gave HTTP response to HTTPS
+#     client".
+#
+#   The GPU node and WSL
+#     WSL's mirrored networking blocks connections INTO the GPU node. Pulling
+#     from here is the GPU node connecting OUT, which works.
+#
+#   Deleting images
+#     Deleting a tag only removes the reference; reclaim disk with
+#       kubectl exec deploy/registry -- registry garbage-collect --delete-untagged /etc/distribution/config.yml
+#     Run it when nothing is pushing.
+#
+#   nodeSelector
+#     Required: hostPath volume.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: registry
+  name: registry
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: registry
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: registry
+    spec:
+      containers:
+      - name: registry
+        image: registry:3.1.1
+        imagePullPolicy: IfNotPresent
+        env:
+        # The image ships with debug logging; one line per request is enough.
+        - name: REGISTRY_LOG_LEVEL
+          value: info
+        ports:
+        - containerPort: 5000
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /v2/
+            port: 5000
+          periodSeconds: 15
+        resources:
+          requests:
+            memory: 32Mi
+          limits:
+            memory: 256Mi
+        volumeMounts:
+        - mountPath: /var/lib/registry
+          name: data
+      nodeSelector:
+        homelab.local/cpu: 'true'
+      volumes:
+      - hostPath:
+          path: ${DATA_ROOT}/registry-data
+          type: DirectoryOrCreate
+        name: data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: registry
+  name: registry
+  namespace: default
+spec:
+  externalTrafficPolicy: Cluster
+  ports:
+  - nodePort: 30500
+    port: 5000
+    protocol: TCP
+    targetPort: 5000
+  selector:
+    app: registry
+  type: NodePort

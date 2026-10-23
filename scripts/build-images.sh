@@ -1,7 +1,27 @@
 #!/usr/bin/env bash
+#   ./scripts/build-images.sh                          build + import the three local images
+#   ./scripts/build-images.sh push <name:tag> <dir>    build <dir>, push to $REGISTRY/<name:tag>
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"; load_config
-c_step "Building local images"
 BUILDER="${BUILDER:-podman}"; need "$BUILDER"
+
+# Build and push to the in-cluster registry (manifests/cpu/registry.yaml).
+# Any node configured with registry-node-setup.sh can then pull it.
+build_and_push() { # <name:tag> <context-dir>
+  local name="${1:?usage: build-images.sh push <name:tag> <context-dir>}" ctx="${2:?context dir}"
+  : "${REGISTRY:?set REGISTRY in config.env, e.g. REGISTRY=\"\$CLUSTER_IP:30500\"}"
+  [ -d "$ctx" ] || { c_err "context not found: $ctx"; exit 1; }
+  local ref="$REGISTRY/$name"
+  c_step "Building $ref"
+  "$BUILDER" build -t "$ref" "$ctx"
+  # The registry is plain HTTP. podman takes a flag; docker needs
+  # "insecure-registries" in /etc/docker/daemon.json instead.
+  if [ "$BUILDER" = podman ]; then "$BUILDER" push --tls-verify=false "$ref"
+  else "$BUILDER" push "$ref"; fi
+  c_ok "pushed $ref"
+}
+if [ "${1:-}" = "push" ]; then shift; build_and_push "$@"; exit 0; fi
+
+c_step "Building local images"
 
 # Three images aren't on any registry - they're built from source and imported
 # straight into the node's containerd. Manifests use imagePullPolicy: Never.

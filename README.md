@@ -36,6 +36,7 @@ credential or a machine-specific hostname.
 | `resume-ai` | cpu | 30505 | Resume/cover-letter generator (Flask + tectonic) |
 | `open-webui` | cpu | 30880 | Chat UI in front of Ollama |
 | `searxng` | cpu | 30081 | Self-hosted metasearch, backs Open WebUI's web search |
+| `registry` | cpu | 30500 | Container registry; nodes pull images pushed here |
 | `airflow-api-server` | cpu | 30808 | Airflow 3 UI/API (+ `airflow-scheduler`, `airflow-postgres`) |
 | `ollama` | gpu | 30434 | LLM serving |
 | `comfyui` | gpu | 30188 | Image generation (node-graph; handles SDXL/Flux/Z-Image) |
@@ -81,6 +82,7 @@ jupyter-data/     notebooks and the persistent kernel venv
 open-webui-data/  webui.db - accounts, chat history, settings
 resume-ai-data/   agent checkpoint sqlite + generated PDFs
 airflow-data/     postgres/ (metadata DB) and logs/ (task logs)
+registry-data/    pushed container images
 ```
 
 ComfyUI additionally mounts `sd-webui-data/models` **read-only**, so both image
@@ -103,6 +105,33 @@ straight into the node's containerd, and their manifests use
 `build-images.sh` builds, `podman save`s, and imports them — over SSH if the
 target is a remote node. Skip it if you only want the registry-backed workloads
 (ollama, comfyui, open-webui, searxng, jupyter).
+
+## Container registry
+
+`manifests/cpu/registry.yaml` runs a plain registry (CNCF Distribution) on
+port 30500. Build and push from your machine, then reference the image from any
+manifest or DAG:
+
+```bash
+./scripts/build-images.sh push training:3f2a1c9 ~/git/training
+#   -> 10.0.0.132:30500/training:3f2a1c9
+```
+
+**One-time setup on every node**, or pulls fail with *"server gave HTTP
+response to HTTPS client"*. Image pulls are done by each node's containerd,
+which expects HTTPS; this marks the registry as plain HTTP and restarts k3s:
+
+```bash
+sudo ./scripts/registry-node-setup.sh 10.0.0.132:30500                          # CPU node
+ssh <gpu-node> 'sudo bash -s 10.0.0.132:30500' < scripts/registry-node-setup.sh  # GPU node
+```
+
+No auth and no TLS, so treat it as LAN-only. Deleting a tag doesn't free disk
+space; see the garbage-collect command in the manifest.
+
+The three images built by `build-images.sh` (no arguments) still go through
+`podman save` and an import into containerd, and their manifests keep
+`imagePullPolicy: Never`. Moving them to the registry is a separate change.
 
 ## Networking note (read this if services are unreachable)
 
