@@ -1,0 +1,652 @@
+# Monitoring - Prometheus + Grafana, in the `monitoring` namespace.
+#
+#   prometheus           scrapes everything below every 30s; 15 days of data
+#   grafana              dashboards, pre-provisioned with Prometheus as the
+#                        datasource and a set of community dashboards
+#   node-exporter        DaemonSet, one per node: CPU, memory, disk, network
+#   kube-state-metrics   Kubernetes objects: pod phases, restarts, requests
+#
+# Container CPU/memory come from each node's kubelet (cAdvisor), read through
+# the API server, so there's no exporter for them. GPU metrics come from
+# manifests/gpu/gpu-exporter.yaml.
+#
+#   Grafana      http://${CLUSTER_IP}:30300   user admin, password in the
+#                grafana-admin Secret (create-secrets.sh grafana)
+#   Prometheus   http://${CLUSTER_IP}:30909
+#
+# Notes:
+#
+#   Why not kube-prometheus-stack
+#     The Helm chart adds the Prometheus Operator, Alertmanager and ~10 CRDs.
+#     That's the right tool for a team; here a plain config file is easier to
+#     read, and the CPU node is at ~75% memory already.
+#
+#   Scraping your own apps
+#     Annotate the pod template (not the Deployment):
+#       prometheus.io/scrape: "true"
+#       prometheus.io/port: "8000"
+#       prometheus.io/path: /metrics        # optional, this is the default
+#     Picked up within a minute, in any namespace.
+#
+#   Changing prometheus.yml
+#     Edit the ConfigMap below, apply, then reload without a restart:
+#       kubectl -n monitoring exec deploy/prometheus -- wget -qO- --post-data= localhost:9090/-/reload
+#     The ConfigMap update takes up to a minute to reach the pod.
+#
+#   The `cluster` label
+#     Every series gets cluster="homelab". The Kubernetes dashboards (dotdc)
+#     filter on it and show nothing without it.
+#
+#   Dashboards
+#     Downloaded from grafana.com by an initContainer at each Grafana start,
+#     into the data folder. If the download fails the previous copy is kept.
+#     Edits made in the UI to these are overwritten on restart - use
+#     "Save as" to keep a modified copy. Add more by ID to DASHBOARDS below.
+#
+#   No auth on Prometheus
+#     Like the registry: LAN-only. Grafana has a login.
+#
+#   node-exporter on the GPU node
+#     hostNetwork, so it's reached at the node's InternalIP - the Tailscale
+#     address. Its numbers describe the WSL VM, not Windows.
+#
+#   nodeSelector
+#     Required for prometheus and grafana: hostPath volumes.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+# ---------------------------------------------------------------- Prometheus
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: ['']
+  resources: [nodes, nodes/proxy, nodes/metrics, services, endpoints, pods]
+  verbs: [get, list, watch]
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [get, list, watch]
+- nonResourceURLs: [/metrics]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+
+    scrape_configs:
+    - job_name: prometheus
+      static_configs:
+      - targets: [localhost:9090]
+      relabel_configs:
+      - target_label: cluster
+        replacement: homelab
+
+    # Kubelet and cAdvisor (per-container CPU/memory/network), fetched through
+    # the API server's node proxy so Prometheus never connects to port 10250
+    # on the nodes directly. Both are job="kubelet", as in kube-prometheus,
+    # which is what the dashboards expect.
+    - job_name: kubelet
+      scheme: https
+      authorization:
+        credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      kubernetes_sd_configs:
+      - role: node
+      relabel_configs:
+      - target_label: cluster
+        replacement: homelab
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: node
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: instance
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/$1/proxy/metrics
+      - target_label: metrics_path
+        replacement: /metrics
+
+    - job_name: cadvisor
+      scheme: https
+      authorization:
+        credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      kubernetes_sd_configs:
+      - role: node
+      relabel_configs:
+      - target_label: cluster
+        replacement: homelab
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: node
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: instance
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+      - target_label: metrics_path
+        replacement: /metrics/cadvisor
+      - target_label: job
+        replacement: kubelet
+
+    # The exporters in this file, found by pod label so the job names match
+    # what the dashboards look for.
+    - job_name: node-exporter
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces: {names: [monitoring]}
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: node-exporter
+        action: keep
+      - target_label: cluster
+        replacement: homelab
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        target_label: node
+
+    - job_name: kube-state-metrics
+      # kube-state-metrics sets namespace/pod labels for the objects it
+      # describes; keep those rather than its own.
+      honor_labels: true
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces: {names: [monitoring]}
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app, __meta_kubernetes_pod_container_port_name]
+        regex: kube-state-metrics;http-metrics
+        action: keep
+      - target_label: cluster
+        replacement: homelab
+
+    # Anything else that opts in with prometheus.io/* annotations.
+    - job_name: kubernetes-pods
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        regex: "true"
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_phase]
+        regex: Pending|Succeeded|Failed
+        action: drop
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        regex: (.+)
+        target_label: __metrics_path__
+      - source_labels: [__meta_kubernetes_pod_ip, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        regex: (.+);(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - target_label: cluster
+        replacement: homelab
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        target_label: node
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: (.+)
+        target_label: job
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: prometheus
+  name: prometheus
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      initContainers:
+      # hostPath directories are created root-owned; Prometheus runs as nobody.
+      - name: fix-perms
+        image: busybox:1.37
+        command: [sh, -c, 'chown -R 65534:65534 /prometheus']
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - mountPath: /prometheus
+          name: data
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v3.15.1
+        imagePullPolicy: IfNotPresent
+        args:
+        - --config.file=/etc/prometheus/prometheus.yml
+        - --storage.tsdb.path=/prometheus
+        - --storage.tsdb.retention.time=15d
+        - --storage.tsdb.retention.size=10GB
+        - --web.enable-lifecycle
+        ports:
+        - containerPort: 9090
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9090
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 1Gi
+        volumeMounts:
+        - mountPath: /etc/prometheus
+          name: config
+        - mountPath: /prometheus
+          name: data
+      nodeSelector:
+        homelab.local/cpu: 'true'
+      volumes:
+      - configMap:
+          name: prometheus-config
+        name: config
+      - hostPath:
+          path: ${DATA_ROOT}/prometheus-data
+          type: DirectoryOrCreate
+        name: data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: prometheus
+  name: prometheus
+  namespace: monitoring
+spec:
+  ports:
+  - nodePort: 30909
+    port: 9090
+    protocol: TCP
+    targetPort: 9090
+  selector:
+    app: prometheus
+  type: NodePort
+---
+# ------------------------------------------------------------- node-exporter
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: node-exporter
+  name: node-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      # Host network and PID namespace so it reports the node's interfaces and
+      # processes rather than its own pod's.
+      hostNetwork: true
+      hostPID: true
+      securityContext:
+        runAsUser: 65534
+        runAsNonRoot: true
+      containers:
+      - name: node-exporter
+        image: prom/node-exporter:v1.12.1
+        imagePullPolicy: IfNotPresent
+        args:
+        - --path.rootfs=/host
+        - --web.listen-address=:9100
+        - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run/k3s|var/lib/kubelet/pods|var/lib/rancher/k3s/agent/containerd/.+)($|/)
+        ports:
+        - containerPort: 9100
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+          limits:
+            memory: 128Mi
+        volumeMounts:
+        - mountPath: /host
+          name: root
+          readOnly: true
+          # No mountPropagation: HostToContainer - WSL's / is a private mount
+          # and containerd refuses it. Disks mounted later show up after a
+          # pod restart.
+      tolerations:
+      - operator: Exists
+      volumes:
+      - hostPath:
+          path: /
+        name: root
+---
+# -------------------------------------------------------- kube-state-metrics
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-state-metrics
+rules:
+- apiGroups: ['']
+  resources: [configmaps, secrets, nodes, pods, services, serviceaccounts, resourcequotas,
+    replicationcontrollers, limitranges, persistentvolumeclaims, persistentvolumes,
+    namespaces, endpoints]
+  verbs: [list, watch]
+- apiGroups: [apps]
+  resources: [statefulsets, daemonsets, deployments, replicasets]
+  verbs: [list, watch]
+- apiGroups: [batch]
+  resources: [cronjobs, jobs]
+  verbs: [list, watch]
+- apiGroups: [autoscaling]
+  resources: [horizontalpodautoscalers]
+  verbs: [list, watch]
+- apiGroups: [policy]
+  resources: [poddisruptionbudgets]
+  verbs: [list, watch]
+- apiGroups: [networking.k8s.io]
+  resources: [networkpolicies, ingresses]
+  verbs: [list, watch]
+- apiGroups: [storage.k8s.io]
+  resources: [storageclasses, volumeattachments]
+  verbs: [list, watch]
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [list, watch]
+- apiGroups: [coordination.k8s.io]
+  resources: [leases]
+  verbs: [list, watch]
+- apiGroups: [certificates.k8s.io]
+  resources: [certificatesigningrequests]
+  verbs: [list, watch]
+- apiGroups: [admissionregistration.k8s.io]
+  resources: [mutatingwebhookconfigurations, validatingwebhookconfigurations]
+  verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-state-metrics
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-state-metrics
+subjects:
+- kind: ServiceAccount
+  name: kube-state-metrics
+  namespace: monitoring
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: kube-state-metrics
+  name: kube-state-metrics
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-state-metrics
+  template:
+    metadata:
+      labels:
+        app: kube-state-metrics
+    spec:
+      serviceAccountName: kube-state-metrics
+      securityContext:
+        runAsUser: 65534
+        runAsNonRoot: true
+      containers:
+      - name: kube-state-metrics
+        image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0
+        imagePullPolicy: IfNotPresent
+        args:
+        # Node labels, so dashboards can tell the cpu and gpu nodes apart.
+        - --metric-labels-allowlist=nodes=[homelab.local/cpu,homelab.local/gpu]
+        ports:
+        - containerPort: 8080
+          name: http-metrics
+        - containerPort: 8081
+          name: telemetry
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: 20m
+            memory: 64Mi
+          limits:
+            memory: 256Mi
+      nodeSelector:
+        homelab.local/cpu: 'true'
+---
+# ------------------------------------------------------------------- Grafana
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: monitoring
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+    - name: Prometheus
+      uid: prometheus
+      type: prometheus
+      access: proxy
+      url: http://prometheus:9090
+      isDefault: true
+      jsonData:
+        timeInterval: 30s
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+    - name: community
+      folder: Homelab
+      type: file
+      allowUiUpdates: false
+      options:
+        path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-fetch-dashboards
+  namespace: monitoring
+data:
+  fetch.sh: |
+    # <grafana.com id> <file name>
+    DASHBOARDS="
+    1860  node-exporter-full
+    15757 k8s-global
+    15758 k8s-namespaces
+    15759 k8s-nodes
+    15760 k8s-pods
+    14574 nvidia-gpu
+    "
+    mkdir -p /dashboards
+    echo "$DASHBOARDS" | while read -r id name; do
+      [ -n "$id" ] || continue
+      if curl -sfL --max-time 30 -o "/tmp/$name.json" \
+          "https://grafana.com/api/dashboards/$id/revisions/latest/download" &&
+          mv "/tmp/$name.json" "/dashboards/$name.json"; then
+        echo "fetched $id -> $name.json"
+      else
+        echo "failed to fetch $id, keeping the existing copy (if any)"
+      fi
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: grafana
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      securityContext:
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
+      initContainers:
+      - name: fix-perms
+        image: busybox:1.37
+        # dashboards/ is mounted by subPath below; created here so it isn't
+        # made root-owned by the kubelet.
+        command: [sh, -c, 'mkdir -p /var/lib/grafana/dashboards && chown -R 472:472 /var/lib/grafana']
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - mountPath: /var/lib/grafana
+          name: data
+      - name: fetch-dashboards
+        image: curlimages/curl:8.16.0
+        command: [sh, /scripts/fetch.sh]
+        volumeMounts:
+        - mountPath: /scripts
+          name: fetch-dashboards
+        - mountPath: /dashboards
+          name: data
+          subPath: dashboards
+      containers:
+      - name: grafana
+        image: grafana/grafana:13.2.5
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: GF_SECURITY_ADMIN_USER
+          value: admin
+        # Only used when the database is first created; after that, change
+        # the password in the UI or with `grafana cli admin reset-admin-password`.
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: grafana-admin
+              key: password
+        - name: GF_SERVER_ROOT_URL
+          value: http://${CLUSTER_IP}:30300
+        - name: GF_ANALYTICS_REPORTING_ENABLED
+          value: 'false'
+        - name: GF_ANALYTICS_CHECK_FOR_UPDATES
+          value: 'false'
+        - name: GF_USERS_ALLOW_SIGN_UP
+          value: 'false'
+        ports:
+        - containerPort: 3000
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            memory: 512Mi
+        volumeMounts:
+        - mountPath: /var/lib/grafana
+          name: data
+        - mountPath: /etc/grafana/provisioning/datasources/datasources.yaml
+          name: provisioning
+          subPath: datasources.yaml
+        - mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml
+          name: provisioning
+          subPath: dashboards.yaml
+      nodeSelector:
+        homelab.local/cpu: 'true'
+      volumes:
+      - configMap:
+          name: grafana-provisioning
+        name: provisioning
+      - configMap:
+          name: grafana-fetch-dashboards
+        name: fetch-dashboards
+      - hostPath:
+          path: ${DATA_ROOT}/grafana-data
+          type: DirectoryOrCreate
+        name: data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: grafana
+  name: grafana
+  namespace: monitoring
+spec:
+  ports:
+  - nodePort: 30300
+    port: 3000
+    protocol: TCP
+    targetPort: 3000
+  selector:
+    app: grafana
+  type: NodePort

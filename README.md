@@ -38,6 +38,9 @@ credential or a machine-specific hostname.
 | `searxng` | cpu | 30081 | Self-hosted metasearch, backs Open WebUI's web search |
 | `registry` | cpu | 30500 | Container registry; nodes pull images pushed here |
 | `airflow-api-server` | cpu | 30808 | Airflow 3 UI/API (+ `airflow-scheduler`, `airflow-postgres`) |
+| `grafana` | cpu | 30300 | Dashboards (namespace `monitoring`) |
+| `prometheus` | cpu | 30909 | Metrics, 15 days (+ `node-exporter` on every node, `kube-state-metrics`) |
+| `gpu-exporter` | gpu | - | GPU utilization/memory/temperature for Prometheus |
 | `ollama` | gpu | 30434 | LLM serving |
 | `comfyui` | gpu | 30188 | Image generation (node-graph; handles SDXL/Flux/Z-Image) |
 | `sd-webui` | gpu | 30860 | AUTOMATIC1111 (optional; ComfyUI is the better backend) |
@@ -83,6 +86,8 @@ open-webui-data/  webui.db - accounts, chat history, settings
 resume-ai-data/   agent checkpoint sqlite + generated PDFs
 airflow-data/     postgres/ (metadata DB) and logs/ (task logs)
 registry-data/    pushed container images
+prometheus-data/  metrics (15 days, capped at 10 GB)
+grafana-data/     grafana.db - users, saved dashboards; dashboards/ (downloaded)
 ```
 
 ComfyUI additionally mounts `sd-webui-data/models` **read-only**, so both image
@@ -163,6 +168,9 @@ values:
 - `my-secrets` - OpenAI + LangSmith, for `my-infer`
 - `resume-ai-secrets` - OpenAI, Flask `SECRET_KEY`, GitHub PAT, LangSmith
 - `jupyter-token` - the Jupyter login token
+- `grafana-admin` (namespace `monitoring`) - Grafana's `admin` password,
+  generated unless `GRAFANA_ADMIN_PASSWORD` is set. Read it with
+  `kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.password}' | base64 -d`
 - `airflow-secrets` - git-sync credentials, the `admin` UI password, and the
   Postgres password / Fernet key / API + JWT secrets. The last four are generated
   on first run and kept on re-runs; `./scripts/create-secrets.sh airflow` touches
@@ -215,6 +223,22 @@ def train(): ...
 
 A task placed on the GPU node writes its log to that node's disk: the UI shows
 it while the task runs, not after.
+
+## Monitoring
+
+Prometheus and Grafana as plain manifests, no operator. See the header of
+`manifests/cpu/monitoring.yaml`. Grafana is at `http://<node>:30300`, user
+`admin`. The **Homelab** folder holds these dashboards, downloaded from
+grafana.com on each Grafana start:
+
+| Dashboard | Shows |
+|---|---|
+| Node Exporter Full | one node in depth: CPU, memory, disks, network |
+| Kubernetes / Views / Global, Nodes, Namespaces, Pods | cluster down to a single pod's CPU/memory |
+| Nvidia GPU Metrics | the GPU node's card: utilization, VRAM, temperature, power |
+
+To have Prometheus scrape your own app, add `prometheus.io/scrape: "true"` and
+`prometheus.io/port` annotations to its pod template.
 
 ## Open WebUI: configuration lives in two places
 

@@ -1,0 +1,56 @@
+# NVIDIA GPU metrics for Prometheus (manifests/cpu/monitoring.yaml):
+# utilization, memory, temperature, power, clocks, per GPU.
+#
+# Notes:
+#
+#   Why not dcgm-exporter
+#     NVIDIA's DCGM doesn't support WSL. This exporter just runs nvidia-smi
+#     and parses its output, which works anywhere nvidia-smi does. Shown in
+#     Grafana by the "Nvidia GPU Metrics" dashboard.
+#
+#   Getting the GPU without the device plugin
+#     Same as jupyter-gpu: RuntimeClass nvidia + NVIDIA_VISIBLE_DEVICES=all.
+#     It doesn't request nvidia.com/gpu, so it never blocks a training pod
+#     from being scheduled.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: gpu-exporter
+  name: gpu-exporter
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gpu-exporter
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '9835'
+      labels:
+        app: gpu-exporter
+    spec:
+      containers:
+      - name: gpu-exporter
+        image: utkuozdemir/nvidia_gpu_exporter:1.15.1
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: all
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: utility
+        ports:
+        - containerPort: 9835
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+          limits:
+            memory: 128Mi
+      nodeSelector:
+        homelab.local/gpu: 'true'
+      runtimeClassName: nvidia
