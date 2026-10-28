@@ -597,6 +597,11 @@ spec:
           value: 'false'
         - name: GF_USERS_ALLOW_SIGN_UP
           value: 'false'
+        # Prometheus scrapes every 30s, so faster refresh only re-runs the same
+        # queries. The GPU dashboard defaults to 10s, which stacked up slow
+        # queries until Grafana was OOM-killed at 512Mi.
+        - name: GF_DASHBOARDS_MIN_REFRESH_INTERVAL
+          value: 30s
         ports:
         - containerPort: 3000
           protocol: TCP
@@ -610,7 +615,7 @@ spec:
             cpu: 50m
             memory: 128Mi
           limits:
-            memory: 512Mi
+            memory: 1Gi
         volumeMounts:
         - mountPath: /var/lib/grafana
           name: data
