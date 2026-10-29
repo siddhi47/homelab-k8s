@@ -87,6 +87,12 @@ on the LAN or not. This is how `rpik8` (Pi 4, 8 GB, arm64) was added.
    `/var/lib/rancher/k3s/server/node-token` on the server.
 5. **Registry:** `ssh <node> 'sudo bash -s <registry>' < scripts/registry-node-setup.sh`.
 6. **Label:** set `PI_NODE` in `config.env` and run `./scripts/label-nodes.sh`.
+7. **Optional, keep k3s writes off the SD card.** On `rpik8`, a USB stick
+   (ext4, label `k3sdata`) is mounted at `/mnt/k3sdata`, with
+   `/var/lib/rancher` and `/var/lib/kubelet` bind-mounted from it via
+   `/etc/fstab` (all `nofail`). A `k3s-agent.service.d` drop-in with
+   `RequiresMountsFor=/var/lib/rancher /var/lib/kubelet` keeps k3s from
+   starting on the empty SD-card directories if the stick is missing.
 
 Only workloads that select `homelab.local/pi=true` are placed on the Pi, apart
 from DaemonSets (node-exporter, the k3s load balancer) and unpinned system
