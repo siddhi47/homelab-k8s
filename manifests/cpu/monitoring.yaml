@@ -19,7 +19,7 @@
 #   Why not kube-prometheus-stack
 #     The Helm chart adds the Prometheus Operator, Alertmanager and ~10 CRDs.
 #     That's the right tool for a team; here a plain config file is easier to
-#     read, and the CPU node is at ~75% memory already.
+#     read, and a Pi 4 runs this comfortably.
 #
 #   Scraping your own apps
 #     Annotate the pod template (not the Deployment):
@@ -50,8 +50,12 @@
 #     hostNetwork, so it's reached at the node's InternalIP - the Tailscale
 #     address. Its numbers describe the WSL VM, not Windows.
 #
-#   nodeSelector
-#     Required for prometheus and grafana: hostPath volumes.
+#   Which node
+#     prometheus, grafana and kube-state-metrics run on the Raspberry Pi when
+#     PI_NODE is set in config.env (data under PI_DATA_ROOT, the Pi's USB
+#     stick), otherwise on the CPU node under DATA_ROOT. lib.sh picks
+#     MONITORING_NODE / MONITORING_DATA_ROOT. Moving between nodes does not
+#     move the data - copy prometheus-data/ and grafana-data/ across first.
 
 apiVersion: v1
 kind: Namespace
@@ -286,13 +290,13 @@ spec:
         - mountPath: /prometheus
           name: data
       nodeSelector:
-        homelab.local/cpu: 'true'
+        homelab.local/${MONITORING_NODE}: 'true'
       volumes:
       - configMap:
           name: prometheus-config
         name: config
       - hostPath:
-          path: ${DATA_ROOT}/prometheus-data
+          path: ${MONITORING_DATA_ROOT}/prometheus-data
           type: DirectoryOrCreate
         name: data
 ---
@@ -474,7 +478,7 @@ spec:
           limits:
             memory: 256Mi
       nodeSelector:
-        homelab.local/cpu: 'true'
+        homelab.local/${MONITORING_NODE}: 'true'
 ---
 # ------------------------------------------------------------------- Grafana
 apiVersion: v1
@@ -626,7 +630,7 @@ spec:
           name: provisioning
           subPath: dashboards.yaml
       nodeSelector:
-        homelab.local/cpu: 'true'
+        homelab.local/${MONITORING_NODE}: 'true'
       volumes:
       - configMap:
           name: grafana-provisioning
@@ -635,7 +639,7 @@ spec:
           name: grafana-fetch-dashboards
         name: fetch-dashboards
       - hostPath:
-          path: ${DATA_ROOT}/grafana-data
+          path: ${MONITORING_DATA_ROOT}/grafana-data
           type: DirectoryOrCreate
         name: data
 ---
