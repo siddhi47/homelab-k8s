@@ -51,13 +51,47 @@ credential or a machine-specific hostname.
 The manifests are generic. Two things make them so:
 
 **Node selection by label, not hostname.** Manifests select
-`homelab.local/cpu=true` / `homelab.local/gpu=true`. `deploy.sh` applies those
+`homelab.local/cpu=true` / `homelab.local/gpu=true` (and `homelab.local/pi=true`
+for the optional Raspberry Pi). `deploy.sh` applies those
 labels to whichever nodes you named in `config.env`, so the YAML never mentions a
 machine. Set `GPU_NODE=""` to skip GPU workloads entirely on a CPU-only cluster.
 
 **Storage via `${DATA_ROOT}`.** hostPath volumes are rendered at apply time with
 `envsubst`, restricted to that single variable — several manifests embed shell
 scripts full of `$(...)` and `\$VAR` that must survive untouched.
+
+## Adding a node (Raspberry Pi example)
+
+Nodes join over Tailscale: flannel runs on `tailscale0` and every node's
+`node-ip` is its Tailscale address, so the same steps work whether the node is
+on the LAN or not. This is how `rpik8` (Pi 4, 8 GB, arm64) was added.
+
+1. **Flash Raspberry Pi OS Lite (64-bit).** Pi OS configures itself on first
+   boot from cloud-init files on the boot partition. If Imager's settings
+   weren't applied, `user-data` and `network-config` are only comments and the
+   Pi boots with no Wi-Fi and no SSH. Fill them in by hand: a user with your
+   SSH key, `enable_ssh: true`, and a netplan `wifis:` entry with
+   `regulatory-domain`.
+2. **Memory cgroups:** append `cgroup_memory=1 cgroup_enable=memory` to the
+   single line in `/boot/firmware/cmdline.txt`, or the k3s agent won't start.
+3. **Tailscale**, from its apt repo (pkgs.tailscale.com/stable/debian), then
+   `sudo tailscale up --hostname=<name>` and approve the login link.
+4. **k3s agent, same version as the server.** Put the node settings in
+   `/etc/rancher/k3s/config.yaml` only, not also as installer flags:
+   ```
+   node-ip: <tailscale ip>
+   flannel-iface: tailscale0
+   ```
+   then install with `INSTALL_K3S_VERSION=<server version>`,
+   `K3S_URL=https://<server tailscale ip>:6443` and the token from
+   `/var/lib/rancher/k3s/server/node-token` on the server.
+5. **Registry:** `ssh <node> 'sudo bash -s <registry>' < scripts/registry-node-setup.sh`.
+6. **Label:** set `PI_NODE` in `config.env` and run `./scripts/label-nodes.sh`.
+
+Only workloads that select `homelab.local/pi=true` are placed on the Pi, apart
+from DaemonSets (node-exporter, the k3s load balancer) and unpinned system
+pods, all of which have arm64 images. Images built on the NUC are amd64-only
+and can't run there.
 
 ## Prerequisites
 

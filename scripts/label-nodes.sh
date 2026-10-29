@@ -9,3 +9,7 @@ if [ -n "${GPU_NODE:-}" ]; then
   kubectl label node "$GPU_NODE" homelab.local/gpu=true --overwrite >/dev/null
   c_ok "$GPU_NODE  homelab.local/gpu=true"
 fi
+if [ -n "${PI_NODE:-}" ]; then
+  kubectl label node "$PI_NODE" homelab.local/pi=true --overwrite >/dev/null
+  c_ok "$PI_NODE  homelab.local/pi=true"
+fi

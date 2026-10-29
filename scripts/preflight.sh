@@ -20,4 +20,8 @@ if [ -n "${GPU_NODE:-}" ]; then
 else
   c_warn "GPU_NODE empty - GPU workloads will be skipped"
 fi
+if [ -n "${PI_NODE:-}" ]; then
+  kubectl get node "$PI_NODE" >/dev/null 2>&1 && c_ok "Pi node present: $PI_NODE" \
+    || c_warn "PI_NODE '$PI_NODE' not found - it won't be labelled"
+fi
 c_ok "preflight passed"

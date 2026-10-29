@@ -456,7 +456,7 @@ spec:
         imagePullPolicy: IfNotPresent
         args:
         # Node labels, so dashboards can tell the cpu and gpu nodes apart.
-        - --metric-labels-allowlist=nodes=[homelab.local/cpu,homelab.local/gpu]
+        - --metric-labels-allowlist=nodes=[homelab.local/cpu,homelab.local/gpu,homelab.local/pi]
         ports:
         - containerPort: 8080
           name: http-metrics

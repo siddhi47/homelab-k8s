@@ -13,7 +13,7 @@ load_config() {
   set -a; source "$ROOT/config.env"; set +a
   : "${DATA_ROOT:?}" "${CPU_NODE:?}"
   : "${AIRFLOW_DAGS_BRANCH:=main}" "${AIRFLOW_DAGS_SUBDIR:=}"
-  export DATA_ROOT CPU_NODE GPU_NODE CLUSTER_IP \
+  export DATA_ROOT CPU_NODE GPU_NODE PI_NODE CLUSTER_IP \
     AIRFLOW_DAGS_REPO AIRFLOW_DAGS_BRANCH AIRFLOW_DAGS_SUBDIR
 }
 
