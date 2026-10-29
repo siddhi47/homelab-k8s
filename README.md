@@ -40,6 +40,7 @@ credential or a machine-specific hostname.
 | `airflow-api-server` | cpu | 30808 | Airflow 3 UI/API (+ `airflow-scheduler`, `airflow-postgres`) |
 | `grafana` | cpu | 30300 | Dashboards (namespace `monitoring`) |
 | `prometheus` | cpu | 30909 | Metrics, 15 days (+ `node-exporter` on every node, `kube-state-metrics`) |
+| `loki` | cpu | - | Container logs, 15 days (+ `alloy` on every node); query in Grafana |
 | `gpu-exporter` | gpu | - | GPU utilization/memory/temperature for Prometheus |
 | `ollama` | gpu | 30434 | LLM serving |
 | `comfyui` | gpu | 30188 | Image generation (node-graph; handles SDXL/Flux/Z-Image) |
@@ -128,6 +129,8 @@ airflow-data/     postgres/ (metadata DB) and logs/ (task logs)
 registry-data/    pushed container images
 prometheus-data/  metrics (15 days, capped at 10 GB)
 grafana-data/     grafana.db - users, saved dashboards; dashboards/ (downloaded)
+loki-data/        logs (15 days, no size cap)
+alloy-data/       Alloy's read positions in /var/log/pods (every node)
 ```
 
 ComfyUI additionally mounts `sd-webui-data/models` **read-only**, so both image
@@ -279,6 +282,10 @@ grafana.com on each Grafana start:
 
 To have Prometheus scrape your own app, add `prometheus.io/scrape: "true"` and
 `prometheus.io/port` annotations to its pod template.
+
+Logs from every container go to Loki (`manifests/cpu/loki.yaml`) via Alloy;
+nothing to add per app. In Grafana use Explore -> Loki, e.g.
+`{namespace="airflow-tasks"} |= "error"`, or Drilldown -> Logs to browse.
 
 ## Open WebUI: configuration lives in two places
 

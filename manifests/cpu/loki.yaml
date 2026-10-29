@@ -1,0 +1,367 @@
+# Logs - Loki + Alloy, in the `monitoring` namespace.
+#
+#   loki    stores container logs; 15 days, same as Prometheus. Single
+#           binary, filesystem storage, no auth
+#   alloy   DaemonSet, one per node: tails /var/log/pods for the pods on its
+#           node and pushes them to Loki
+#
+# Query in Grafana (Explore -> Loki, or Drilldown -> Logs). The datasource is
+# provisioned in monitoring.yaml. Every stream has the labels cluster,
+# namespace, pod, container, node, and app (the pod's `app` label).
+#   {namespace="airflow-tasks"} |= "error"
+#   sum by (app) (rate({cluster="homelab"}[5m]))
+#
+# Notes:
+#
+#   Why Alloy, not Promtail
+#     Promtail is end-of-life; Alloy is Grafana's replacement for it.
+#
+#   Why files, not the Kubernetes API
+#     loki.source.kubernetes would avoid the hostPath, but sends every log
+#     line through the API server. Reading /var/log/pods is how kubectl logs
+#     gets them anyway.
+#
+#   Retention
+#     retention_period below; the compactor deletes older chunks. There is no
+#     size cap like Prometheus has - a noisy pod can fill the disk. Check with
+#       du -sh ${MONITORING_DATA_ROOT}/loki-data      (on that node; the
+#     image has no shell tools, so not through kubectl exec)
+#
+#   Which node
+#     Same as Prometheus: MONITORING_NODE / MONITORING_DATA_ROOT (lib.sh).
+#     Alloy keeps its read positions in ${DATA_ROOT}/alloy-data on each node,
+#     so a restart doesn't re-send old lines.
+#
+#   Order
+#     deploy.sh applies files alphabetically, so this comes before
+#     monitoring.yaml; the Namespace is repeated here for a fresh cluster.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+# ---------------------------------------------------------------------- Loki
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: monitoring
+data:
+  loki.yaml: |
+    auth_enabled: false
+
+    server:
+      http_listen_port: 3100
+      grpc_listen_port: 9095
+      log_level: warn
+
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /loki
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+      storage:
+        filesystem:
+          chunks_directory: /loki/chunks
+          rules_directory: /loki/rules
+
+    schema_config:
+      configs:
+      - from: 2026-10-01
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: index_
+          period: 24h
+
+    limits_config:
+      retention_period: 360h
+      # Needed by Grafana's Logs Drilldown.
+      volume_enabled: true
+      allow_structured_metadata: true
+
+    pattern_ingester:
+      enabled: true
+
+    compactor:
+      working_directory: /loki/compactor
+      retention_enabled: true
+      delete_request_store: filesystem
+
+    analytics:
+      reporting_enabled: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: loki
+  name: loki
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: loki
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '3100'
+    spec:
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      initContainers:
+      # hostPath directories are created root-owned; Loki runs as 10001.
+      - name: fix-perms
+        image: busybox:1.37
+        command: [sh, -c, 'chown -R 10001:10001 /loki']
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - mountPath: /loki
+          name: data
+      containers:
+      - name: loki
+        image: grafana/loki:3.7.9
+        imagePullPolicy: IfNotPresent
+        args:
+        - -config.file=/etc/loki/loki.yaml
+        ports:
+        - containerPort: 3100
+          name: http
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 3100
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 1Gi
+        volumeMounts:
+        - mountPath: /etc/loki
+          name: config
+        - mountPath: /loki
+          name: data
+      nodeSelector:
+        homelab.local/${MONITORING_NODE}: 'true'
+      volumes:
+      - configMap:
+          name: loki-config
+        name: config
+      - hostPath:
+          path: ${MONITORING_DATA_ROOT}/loki-data
+          type: DirectoryOrCreate
+        name: data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: loki
+  name: loki
+  namespace: monitoring
+spec:
+  ports:
+  - name: http
+    port: 3100
+    protocol: TCP
+    targetPort: 3100
+  selector:
+    app: loki
+---
+# --------------------------------------------------------------------- Alloy
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alloy
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: alloy
+rules:
+- apiGroups: ['']
+  resources: [pods, nodes]
+  verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alloy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: alloy
+subjects:
+- kind: ServiceAccount
+  name: alloy
+  namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: monitoring
+data:
+  config.alloy: |
+    // Pods on this node only; each Alloy tails its own node's files.
+    discovery.kubernetes "pods" {
+      role = "pod"
+      selectors {
+        role  = "pod"
+        field = "spec.nodeName=" + sys.env("NODE_NAME")
+      }
+    }
+
+    discovery.relabel "pods" {
+      targets = discovery.kubernetes.pods.targets
+
+      rule {
+        target_label = "cluster"
+        replacement  = "homelab"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_node_name"]
+        target_label  = "node"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app"]
+        target_label  = "app"
+      }
+      // /var/log/pods/<namespace>_<pod>_<uid>/<container>/<restart>.log
+      rule {
+        source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+        separator     = "/"
+        replacement   = "/var/log/pods/*$1/*.log"
+        target_label  = "__path__"
+      }
+    }
+
+    local.file_match "pods" {
+      path_targets = discovery.relabel.pods.output
+    }
+
+    loki.source.file "pods" {
+      targets    = local.file_match.pods.targets
+      forward_to = [loki.process.pods.receiver]
+    }
+
+    // containerd writes "<time> <stream> <flag> <line>"; keep just the line,
+    // with its original timestamp.
+    // Loki rejects lines older than a week; on first start Alloy reads each
+    // file from the top, so drop those here rather than log a 400 per batch.
+    loki.process "pods" {
+      stage.cri {}
+      stage.drop {
+        older_than          = "168h"
+        drop_counter_reason = "too_old"
+      }
+      forward_to = [loki.write.default.receiver]
+    }
+
+    loki.write "default" {
+      endpoint {
+        url = "http://loki.monitoring.svc:3100/loki/api/v1/push"
+      }
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: alloy
+  name: alloy
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: alloy
+  template:
+    metadata:
+      labels:
+        app: alloy
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: '12345'
+    spec:
+      serviceAccountName: alloy
+      containers:
+      - name: alloy
+        image: grafana/alloy:v1.21.3
+        imagePullPolicy: IfNotPresent
+        args:
+        - run
+        - /etc/alloy/config.alloy
+        - --storage.path=/var/lib/alloy
+        - --server.http.listen-addr=0.0.0.0:12345
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        ports:
+        - containerPort: 12345
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 12345
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: 20m
+            memory: 64Mi
+          limits:
+            memory: 256Mi
+        # Root, to read the log files, which the kubelet makes 0640 root.
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - mountPath: /etc/alloy
+          name: config
+        - mountPath: /var/lib/alloy
+          name: data
+        - mountPath: /var/log/pods
+          name: pod-logs
+          readOnly: true
+      tolerations:
+      - operator: Exists
+      volumes:
+      - configMap:
+          name: alloy-config
+        name: config
+      - hostPath:
+          path: ${DATA_ROOT}/alloy-data
+          type: DirectoryOrCreate
+        name: data
+      - hostPath:
+          path: /var/log/pods
+        name: pod-logs

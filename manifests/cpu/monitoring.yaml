@@ -498,6 +498,12 @@ data:
       isDefault: true
       jsonData:
         timeInterval: 30s
+    # manifests/cpu/loki.yaml
+    - name: Loki
+      uid: loki
+      type: loki
+      access: proxy
+      url: http://loki:3100
   dashboards.yaml: |
     apiVersion: 1
     providers:
